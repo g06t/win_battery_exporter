@@ -2,23 +2,21 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"os/signal"
-	"sync"
-	"syscall"
-	"time"
-	"errors"
 	"path/filepath"
-	"gopkg.in/yaml.v3"
+	"sync"
+	"time"
+
 	"github.com/distatus/battery"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-   	"golang.org/x/sys/windows/svc"
-    "golang.org/x/sys/windows/svc/debug"
-
+	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/debug"
+	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
@@ -54,7 +52,17 @@ func (m *myService) Execute(args []string, r <-chan svc.ChangeRequest, status ch
     label += "_battery_percent"
 	collector := newCollector(label)
 	prometheus.MustRegister(collector)
-    go startHTTPServer(&waitGroup, m.config.Port, m.config.Pattern)
+	server := &http.Server{
+		Addr: m.config.Port,
+	}
+	http.Handle(m.config.Pattern, promhttp.Handler())
+	go func() {
+		defer waitGroup.Done()
+		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+            log.Fatalf("HTTP server error: %v", err)
+        }
+        log.Println("Stopped serving new connections.")
+    }()
 
 loop:
     for {
@@ -67,6 +75,7 @@ loop:
                 status <- c.CurrentStatus
             case svc.Stop, svc.Shutdown:
                 log.Print("Shutting service...!")
+				server.Shutdown(context.Background())
                 break loop
             case svc.Pause:
                 status <- svc.Status{State: svc.Paused, Accepts: cmdsAccepted}
@@ -125,39 +134,15 @@ func (collector *Collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(collector.batteryGauge, prometheus.GaugeValue, 0.0)
 	}
 	percent := (totalCurrentCapacity / totalFullCapacity)*100
-	
+	if percent < 0 || percent > 100 {
+		log.Println("WARN: Percent value out of range, returning 0")
+		percent = 0.0
+	}
 	ch <- prometheus.MustNewConstMetric(collector.batteryGauge, prometheus.GaugeValue, percent)
 }
 
-func startHTTPServer(waitGroup *sync.WaitGroup, port string, pattern string) {
-	server := &http.Server{
-		Addr: port,
-	}
-	http.Handle("/metrics", promhttp.Handler())
-	go func() {
-		defer waitGroup.Done()
-		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-            log.Fatalf("HTTP server error: %v", err)
-        }
-        log.Println("Stopped serving new connections.")
-    }()
-
-    sigChan := make(chan os.Signal, 1)
-    signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-    <-sigChan
-
-    shutdownCtx, shutdownRelease := context.WithTimeout(context.Background(), 10*time.Second)
-    defer shutdownRelease()
-
-    if err := server.Shutdown(shutdownCtx); err != nil {
-        log.Fatalf("HTTP shutdown error: %v", err)
-    }
-    log.Println("Graceful shutdown complete.")
-
-}
-
 func main() {
-	fp, _ := filepath.Abs("./config.yaml")
+	fp, _ := filepath.Abs("E:/Program Files/service/config.yaml")
 	yamlFile, err := os.ReadFile(fp)
 	if err != nil {
 		log.Fatal("Cannot read config file...")
