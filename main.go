@@ -1,22 +1,42 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
- 	"golang.org/x/sys/windows/svc"
-    "golang.org/x/sys/windows/svc/debug"
-    "log"
-    "os"
+	"errors"
+	"path/filepath"
+	"gopkg.in/yaml.v3"
 	"github.com/distatus/battery"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+   	"golang.org/x/sys/windows/svc"
+    "golang.org/x/sys/windows/svc/debug"
+
 )
+
+type Config struct {
+	Port string `yaml:"port"`
+	Log string `yaml:"log"`
+	Pattern string `yaml:"pattern"`
+	Name string `yaml:"name"`
+}
+
+type Collector struct {
+	batteryGauge	*prometheus.Desc
+}
 
 type myService struct{}
 
-func (m *myService) Execute(args []string, r <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
+func (m *myService) Execute(config Config, r <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
+	var waitGroup sync.WaitGroup
+	waitGroup.Add(1)
 
     const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPauseAndContinue
     tick := time.Tick(5 * time.Second)
@@ -25,12 +45,14 @@ func (m *myService) Execute(args []string, r <-chan svc.ChangeRequest, status ch
 
     status <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 
-    recordMetrics()
-    go func() {
-        http.Handle("/metrics", promhttp.HandlerFor(newRegistry, promhttp.HandlerOpts{}))
-        log.Println("Starting HTTP server on :9090")
-        http.ListenAndServe(":9090", nil)
-    }()
+    label, err := os.Hostname()
+    if err != nil {
+    	log.Println("Could not get Hostname.") 	
+    }
+    label += "_battery_percent"
+	collector := newCollector(label)
+	prometheus.MustRegister(collector)
+    go startHTTPServer(&waitGroup, config.Port, config.Pattern)
 
 loop:
     for {
@@ -53,78 +75,105 @@ loop:
             }
         }
     }
-
+    waitGroup.Wait()
     status <- svc.Status{State: svc.StopPending}
     return false, 1
 }
 
-func runService(name string, isDebug bool) {
+func runService(config Config, isDebug bool) {
     if isDebug {
-        err := debug.Run(name, &myService{})
+        err := debug.Run(config.Name, &myService{})
         if err != nil {
             log.Fatalln("Error running service in debug mode.")
         }
     } else {
-        err := svc.Run(name, &myService{})
+        err := svc.Run(config, &myService{})
         if err != nil {
             log.Fatalln("Error running service in Service Control mode.")
         }
     }
 }
 
-func fetchBattery() float64{
-	var totalCurrentCapacity float64 = 0.0
-    var totalFullCapacity float64 = 0.0
+func newCollector(s string) *Collector {
+	return &Collector{
+		batteryGauge: prometheus.NewDesc(s,
+		 "Display current total battery level.", nil, nil),
+	}
+}
 
+func (collector *Collector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- collector.batteryGauge
+}
+
+func (collector *Collector) Collect(ch chan<- prometheus.Metric) {
+	
+	var totalCurrentCapacity float64 = 0.0
+	var totalFullCapacity float64 = 0.0
 	batteries, err := battery.GetAll()
 		if err != nil {
-			log.Printf("Could not get battery info.: %v", err)
+			log.Println("Could not get battery info...")
 		}
-	if len(batteries) == 0 {
-        log.Println("No batteries found.")
-    }
-
-    for _, battery := range batteries {
-        if battery.Full > 0 && battery.Current >= 0 {
-            totalCurrentCapacity += battery.Current
-            totalFullCapacity += battery.Full
-        }
+	for _, battery := range batteries {
+		totalCurrentCapacity += battery.Current
+		totalFullCapacity += battery.Full
 	}
-    if totalFullCapacity <= 0{
-        return 0.0
-    }
-	percent := (totalCurrentCapacity / totalFullCapacity) * 100
-    return percent
+	if totalFullCapacity <= 0 {
+		log.Println("WARN: Full capacity <= 0, returning 0")
+		ch <- prometheus.MustNewConstMetric(collector.batteryGauge, prometheus.GaugeValue, 0.0)
+	}
+	percent := (totalCurrentCapacity / totalFullCapacity)*100
+	
+	ch <- prometheus.MustNewConstMetric(collector.batteryGauge, prometheus.GaugeValue, percent)
 }
 
-func recordMetrics() {
+func startHTTPServer(waitGroup *sync.WaitGroup, port string, pattern string) {
+	server := &http.Server{
+		Addr: port,
+	}
+	http.Handle("/metrics", promhttp.Handler())
 	go func() {
-		for {
-			batterygauge.Set(fetchBattery())
-			time.Sleep(5 * time.Second)
-		}
-	}()
+		defer waitGroup.Done()
+		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+            log.Fatalf("HTTP server error: %v", err)
+        }
+        log.Println("Stopped serving new connections.")
+    }()
+
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+    <-sigChan
+
+    shutdownCtx, shutdownRelease := context.WithTimeout(context.Background(), 10*time.Second)
+    defer shutdownRelease()
+
+    if err := server.Shutdown(shutdownCtx); err != nil {
+        log.Fatalf("HTTP shutdown error: %v", err)
+    }
+    log.Println("Graceful shutdown complete.")
+
 }
-
-var (
-    newRegistry = prometheus.NewRegistry()
-)
-
-var (
-	batterygauge = promauto.With(newRegistry).NewGauge(prometheus.GaugeOpts{
-		Name: "battery_percentage",
-		Help: "Current battery percentage.",
-	})
-)
 
 func main() {
-    f, err := os.OpenFile("E:/Program Files/service/debug.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	fp, _ := filepath.Abs("./config.yaml")
+	yamlFile, err := os.ReadFile(fp)
+	if err != nil {
+		log.Fatal("Cannot read config file...")
+	}
+	
+	var config Config
+	
+	if err := yaml.Unmarshal(yamlFile, &config)
+	err != nil {
+		log.Fatal("Failed to unmarshal yaml file...")
+	}
+	
+	f, err := os.OpenFile(config.Log, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
     if err != nil {
         log.Fatalln(fmt.Errorf("error opening file: %v", err))
     }
     defer f.Close()
 
     log.SetOutput(f)
-    runService("win_battery_exporter", false)
+    runService(config, false)
 
 }

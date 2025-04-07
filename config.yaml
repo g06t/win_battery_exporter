@@ -1,0 +1,4 @@
+port: ":9090"
+log: "./debug.log"
+pattern: "/metrics"
+name: "win_battery_exporter"
