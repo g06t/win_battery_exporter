@@ -32,9 +32,11 @@ type Collector struct {
 	batteryGauge	*prometheus.Desc
 }
 
-type myService struct{}
+type myService struct{
+	config Config
+}
 
-func (m *myService) Execute(config Config, r <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
+func (m *myService) Execute(args []string, r <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
 	var waitGroup sync.WaitGroup
 	waitGroup.Add(1)
 
@@ -52,7 +54,7 @@ func (m *myService) Execute(config Config, r <-chan svc.ChangeRequest, status ch
     label += "_battery_percent"
 	collector := newCollector(label)
 	prometheus.MustRegister(collector)
-    go startHTTPServer(&waitGroup, config.Port, config.Pattern)
+    go startHTTPServer(&waitGroup, m.config.Port, m.config.Pattern)
 
 loop:
     for {
@@ -81,13 +83,14 @@ loop:
 }
 
 func runService(config Config, isDebug bool) {
-    if isDebug {
-        err := debug.Run(config.Name, &myService{})
+    svce := &myService{config: config}
+	if isDebug {
+        err := debug.Run(config.Name, svce)
         if err != nil {
             log.Fatalln("Error running service in debug mode.")
         }
     } else {
-        err := svc.Run(config, &myService{})
+        err := svc.Run(config.Name, svce)
         if err != nil {
             log.Fatalln("Error running service in Service Control mode.")
         }
@@ -162,8 +165,7 @@ func main() {
 	
 	var config Config
 	
-	if err := yaml.Unmarshal(yamlFile, &config)
-	err != nil {
+	if err := yaml.Unmarshal(yamlFile, &config); err != nil {
 		log.Fatal("Failed to unmarshal yaml file...")
 	}
 	
