@@ -83,7 +83,7 @@ loop:
         }
     }
     status <- svc.Status{State: svc.StopPending}
-    return false, 1
+    return false, 0
 }
 
 func runService(config Config, isDebug bool) {
