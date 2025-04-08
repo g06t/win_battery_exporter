@@ -8,9 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
-
 	"github.com/distatus/battery"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -35,8 +33,6 @@ type myService struct{
 }
 
 func (m *myService) Execute(args []string, r <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
-	var waitGroup sync.WaitGroup
-	waitGroup.Add(1)
 
     const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPauseAndContinue
     tick := time.Tick(5 * time.Second)
@@ -57,13 +53,13 @@ func (m *myService) Execute(args []string, r <-chan svc.ChangeRequest, status ch
 	}
 	http.Handle(m.config.Pattern, promhttp.Handler())
 	go func() {
-		defer waitGroup.Done()
 		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
             log.Fatalf("HTTP server error: %v", err)
         }
         log.Println("Stopped serving new connections.")
     }()
-
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 loop:
     for {
         select {
@@ -75,7 +71,7 @@ loop:
                 status <- c.CurrentStatus
             case svc.Stop, svc.Shutdown:
                 log.Print("Shutting service...!")
-				server.Shutdown(context.Background())
+				server.Shutdown(ctx)
                 break loop
             case svc.Pause:
                 status <- svc.Status{State: svc.Paused, Accepts: cmdsAccepted}
@@ -86,7 +82,6 @@ loop:
             }
         }
     }
-    waitGroup.Wait()
     status <- svc.Status{State: svc.StopPending}
     return false, 1
 }
