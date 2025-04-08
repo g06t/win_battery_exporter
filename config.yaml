@@ -1,4 +1,4 @@
-port: ":9090"
-log: "E:/Program Files/service/debug.log"
+port: ":9183"
+log: "C:/Program Files/win_battery_exporter/debug.log"
 pattern: "/metrics"
 name: "win_battery_exporter"

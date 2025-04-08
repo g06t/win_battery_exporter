@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"time"
+
 	"github.com/distatus/battery"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -30,24 +32,22 @@ type Collector struct {
 
 type myService struct{
 	config Config
+	collector *Collector
 }
 
 func (m *myService) Execute(args []string, r <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
 
     const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPauseAndContinue
-    tick := time.Tick(5 * time.Second)
 
     status <- svc.Status{State: svc.StartPending}
 
     status <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 
-    label, err := os.Hostname()
-    if err != nil {
-    	log.Println("Could not get Hostname.") 	
-    }
-    label += "_battery_percent"
-	collector := newCollector(label)
-	prometheus.MustRegister(collector)
+	if m.collector == nil {
+		collector := newCollector()
+		prometheus.MustRegister(collector)
+	}
+
 	server := &http.Server{
 		Addr: m.config.Port,
 	}
@@ -63,8 +63,6 @@ func (m *myService) Execute(args []string, r <-chan svc.ChangeRequest, status ch
 loop:
     for {
         select {
-        case <-tick:
-            log.Print("Tick Handled...!")
         case c := <-r:
             switch c.Cmd {
             case svc.Interrogate:
@@ -101,10 +99,10 @@ func runService(config Config, isDebug bool) {
     }
 }
 
-func newCollector(s string) *Collector {
+func newCollector() *Collector {
 	return &Collector{
-		batteryGauge: prometheus.NewDesc(s,
-		 "Display current total battery level.", nil, nil),
+		batteryGauge: prometheus.NewDesc("current_battery_percent",
+		 "Display current total battery level.", []string{"hostname"}, nil),
 	}
 }
 
@@ -116,28 +114,44 @@ func (collector *Collector) Collect(ch chan<- prometheus.Metric) {
 	
 	var totalCurrentCapacity float64 = 0.0
 	var totalFullCapacity float64 = 0.0
+
+	hostname, err := os.Hostname()
+    if err != nil {
+    	log.Println("Could not get Hostname.")
+		hostname = "unknown" 	
+    }
+
 	batteries, err := battery.GetAll()
 		if err != nil {
 			log.Println("Could not get battery info...")
 		}
+
+	if len(batteries) < 1 {
+		ch <- prometheus.MustNewConstMetric(collector.batteryGauge, prometheus.GaugeValue, 0.0, hostname)
+		return
+	}
+		
 	for _, battery := range batteries {
 		totalCurrentCapacity += battery.Current
 		totalFullCapacity += battery.Full
 	}
 	if totalFullCapacity <= 0 {
 		log.Println("WARN: Full capacity <= 0, returning 0")
-		ch <- prometheus.MustNewConstMetric(collector.batteryGauge, prometheus.GaugeValue, 0.0)
+		ch <- prometheus.MustNewConstMetric(collector.batteryGauge, prometheus.GaugeValue, 0.0, hostname)
+		return
 	}
 	percent := (totalCurrentCapacity / totalFullCapacity)*100
 	if percent < 0 || percent > 100 {
 		log.Println("WARN: Percent value out of range, returning 0")
 		percent = 0.0
 	}
-	ch <- prometheus.MustNewConstMetric(collector.batteryGauge, prometheus.GaugeValue, percent)
+	ch <- prometheus.MustNewConstMetric(collector.batteryGauge, prometheus.GaugeValue, percent, hostname)
 }
 
 func main() {
-	fp, _ := filepath.Abs("E:/Program Files/service/config.yaml")
+	confPtr := flag.String("path", "C:/Program Files/win_battery_exporter/config.yaml", "Specify path to config file.")
+
+	fp, _ := filepath.Abs(*confPtr)
 	yamlFile, err := os.ReadFile(fp)
 	if err != nil {
 		log.Fatal("Cannot read config file...")
@@ -146,7 +160,11 @@ func main() {
 	var config Config
 	
 	if err := yaml.Unmarshal(yamlFile, &config); err != nil {
-		log.Fatal("Failed to unmarshal yaml file...")
+		log.Println("Failed to unmarshal yaml file setting default values.")
+		config.Port = ":9183"
+		config.Name = "win_battery_exporter"
+		config.Pattern = "/metrics"
+		config.Log = "C:/Program Files/win_battery_exporter/debug.log"
 	}
 	
 	f, err := os.OpenFile(config.Log, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
