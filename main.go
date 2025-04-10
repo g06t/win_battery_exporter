@@ -54,9 +54,9 @@ func (m *myService) Execute(args []string, r <-chan svc.ChangeRequest, status ch
 	http.Handle(m.config.Pattern, promhttp.Handler())
 	go func() {
 		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-            log.Fatalf("HTTP server error: %v", err)
+            log.Fatalf("ERROR: HTTP server error: %v", err)
         }
-        log.Println("Stopped serving new connections.")
+        log.Println("INFO: Stopped serving new connections.")
     }()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -68,7 +68,7 @@ loop:
             case svc.Interrogate:
                 status <- c.CurrentStatus
             case svc.Stop, svc.Shutdown:
-                log.Print("Shutting service...!")
+                log.Print("INFO: Shutting service.")
 				server.Shutdown(ctx)
                 break loop
             case svc.Pause:
@@ -76,7 +76,7 @@ loop:
             case svc.Continue:
                 status <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
             default:
-                log.Printf("Unexpected service control request #%d", c)
+                log.Printf("WARN: Unexpected service control request #%d", c)
             }
         }
     }
@@ -89,12 +89,12 @@ func runService(config Config, isDebug bool) {
 	if isDebug {
         err := debug.Run(config.Name, svce)
         if err != nil {
-            log.Fatalln("Error running service in debug mode.")
+            log.Fatalln("ERROR: Error running service in debug mode.")
         }
     } else {
         err := svc.Run(config.Name, svce)
         if err != nil {
-            log.Fatalln("Error running service in Service Control mode.")
+            log.Fatalln("ERROR: Error running service in Service Control mode.")
         }
     }
 }
@@ -117,13 +117,13 @@ func (collector *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	hostname, err := os.Hostname()
     if err != nil {
-    	log.Println("Could not get Hostname.")
+    	log.Println("WARN: Could not get Hostname.")
 		hostname = "unknown" 	
     }
 
 	batteries, err := battery.GetAll()
 		if err != nil {
-			log.Println("Could not get battery info...")
+			log.Println("WARN: Could not get battery info.")
 		}
 
 	if len(batteries) < 1 {
@@ -140,27 +140,35 @@ func (collector *Collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(collector.batteryGauge, prometheus.GaugeValue, 0.0, hostname)
 		return
 	}
+
 	percent := (totalCurrentCapacity / totalFullCapacity)*100
-	if percent < 0 || percent > 100 {
-		log.Println("WARN: Percent value out of range, returning 0")
-		percent = 0.0
+
+	if percent < 0 {
+		ch <- prometheus.MustNewConstMetric(collector.batteryGauge, prometheus.GaugeValue, 0.0, hostname)
+		return
+	} else if percent > 100 {
+		ch <- prometheus.MustNewConstMetric(collector.batteryGauge, prometheus.GaugeValue, 100.0, hostname)
+		return
 	}
+
 	ch <- prometheus.MustNewConstMetric(collector.batteryGauge, prometheus.GaugeValue, percent, hostname)
 }
 
 func main() {
 	confPtr := flag.String("path", "C:/Program Files/win_battery_exporter/config.yaml", "Specify path to config file.")
 
+	var config Config
+	
 	fp, _ := filepath.Abs(*confPtr)
 	yamlFile, err := os.ReadFile(fp)
 	if err != nil {
-		log.Fatal("Cannot read config file...")
+		config.Port = ":9183"
+		config.Name = "win_battery_exporter"
+		config.Pattern = "/metrics"
+		config.Log = "C:/Program Files/win_battery_exporter/debug.log"
 	}
 	
-	var config Config
-	
 	if err := yaml.Unmarshal(yamlFile, &config); err != nil {
-		log.Println("Failed to unmarshal yaml file setting default values.")
 		config.Port = ":9183"
 		config.Name = "win_battery_exporter"
 		config.Pattern = "/metrics"
@@ -173,7 +181,10 @@ func main() {
     }
     defer f.Close()
 
-    log.SetOutput(f)
+	log.SetOutput(f)
+
+
+
     runService(config, false)
 
 }
